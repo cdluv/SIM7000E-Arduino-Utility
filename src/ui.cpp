@@ -95,8 +95,9 @@ bool checkForPinCommand(int index, int value) {
             break;
         case '/':
             Serial.print("===>");
-            charIndex = 1;
+            pinCommand = false;
             break;
+
         default:
             pinCommand = false;
             break;
@@ -107,18 +108,23 @@ bool checkForPinCommand(int index, int value) {
 
 bool checkForPowerScenario(int ix, char value) {
 
-    if (value == '/' && ix == 0) {
-        Serial.println("1. Start module and awake EN=1, SL=0");
-        Serial.println("2. Put module into low power mode EN=1, SL=1");
-        Serial.println("3. Wake module up EN=1, SL=0");
-        Serial.println("4. Turn off the module EN=0, SL=0");
-        return true;
+    if (ix == 0) {
+        if (value == '/') {
+            // starts with /, so is a potential  power scenario.
+            Serial.println("1. Start module and awake EN=1, SL=0");
+            Serial.println("2. Put module into low power mode EN=1, SL=1");
+            Serial.println("3. Wake module up EN=1, SL=0");
+            Serial.println("4. Turn off the module EN=0, SL=0");
+            return false;
+        }
     }
-
-    if ((ix > 0 || data[0] != '/')) {
+    if (data[0] != '/' || ix != 1) {
+        // doesn't start with / so not a power scenario
         return false;
     }
 
+    // data[0] == '/' and ix == 1
+    // .... so evaluate which power scenario to run (if any)
     switch (value) {
         case '1':
             Serial.println("1. Start module and awake EN=1, SL=0");
@@ -147,9 +153,11 @@ bool checkForPowerScenario(int ix, char value) {
 
         default:
             Serial.println("Invalid command!");
-            break;
+            return false;
     }
 
+    data[ix+1] = 0;
+    Serial.printf("POWER Command executed %s", data);
     return true;
 }
 
@@ -164,29 +172,28 @@ void ui_loop() {
     printStatusIfRequired(5);
 
     while (Serial.available()) {
-        char value = (char) Serial.read();
+        char chr = (char) Serial.read();
 
-        if (checkForPinCommand(charIndex, value)) {
+        if (checkForPinCommand(charIndex, chr)) {
             printStatus();
             resetToNewLine();
             continue;
         }
 
-        if (checkForPowerScenario(charIndex, value)) {
+        if (checkForPowerScenario(charIndex, chr)) {
             printStatus();
             resetToNewLine();
             continue;
         }
 
-        char c = (char) value;
-        data[charIndex] = c;        //Serial.print(c); local echo
-
+        data[charIndex] = chr;        //Serial.print(c); local echo
         charIndex++;
 
-        Serial2.print(c);
-        Serial.print(c);
+        Serial2.print(chr); // echo to phone
+        Serial.print(chr); // echo to console
 
-        if (value == '\r' || value == '\n') {
+        if (chr == '\r' || chr == '\n') {
+            Serial2.flush();
             resetToNewLine();
         }
     }
