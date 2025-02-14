@@ -9,6 +9,6 @@
 
 // "public" methods
 void initUi();
-void ui_loop();
+bool ui_loop();
 
 #endif //SIM7000E_UI_H

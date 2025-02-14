@@ -1,6 +1,8 @@
 //
 // Created by Gary on 05/11/2024.
 //
+#include <cctype>
+#include <esp32-hal.h>
 
 #ifndef SIM7000E_UTILS_H
 #define SIM7000E_UTILS_H
@@ -15,5 +17,5 @@ void sleepGsmLow();
 void readPhone();
 void lightSleep();
 
+#endif //SIM7000E_UTILS_CPP_H
 
-#endif //SIM7000E_UTILS_H

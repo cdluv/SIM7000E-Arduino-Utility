@@ -1,11 +1,18 @@
 #include <Arduino.h>
 #include <app.h>
 #include "utils.h"
+#include <cstring>
+#include <cctype>
 
 void initModem() {
     enableHigh();
-    pwrKeyHigh();
-    sleepGsmLow();
+    delay(200);
+
+    enableLow();
+    delay(200);
+
+    enableHigh();
+    sleepGsmHigh();
 }
 
 void readPhone() {
@@ -16,25 +23,23 @@ void readPhone() {
 
 // ENABLE_GSM = GPIO_NUM_4
 void enableHigh() {
-    Serial.println("Setting GPIO4 (EN) to HIGH");
+    Serial.printf("Setting GPIO%d to 1\n", ENABLE_GSM);
     digitalWrite(ENABLE_GSM, HIGH);
 }
 
-void enableLow() {
-    Serial.println("Setting GPIO14 (EN) to LOW");
+ void  enableLow() {
+    Serial.printf("Setting GPIO%d to 0\n", ENABLE_GSM);
     digitalWrite(ENABLE_GSM, LOW);
 }
 
 // SLEEP_GSM = GPIO_NUM_15
 void sleepGsmHigh() {
-    Serial.println("Setting GPIO15 (SLEEP_GSM) to HIGH - low power mode");
-
+    Serial.printf("Setting GPIO%d (SLEEP_GSM) to 1 - AWAKE\n", SLEEP_GSM);
     digitalWrite(SLEEP_GSM, HIGH);
 }
 
 void sleepGsmLow() {
-    Serial.println("Setting GPIO15 (SLEEP_GSM) to LOW - AWAKE");
-
+    Serial.printf("Setting GPIO%d (SLEEP_GSM) to 0 - low power mode\n", SLEEP_GSM);
     digitalWrite(SLEEP_GSM, LOW);
 }
 
@@ -48,11 +53,39 @@ void lightSleep() {
 }
 
 void pwrKeyHigh() {
-    Serial.println("Setting GPIO13 (PWRKEY) to HIGH");
+    Serial.printf("Setting GPIO%d (PWRKEY) to 1\n", PWRKEY_GSM);
     digitalWrite(PWRKEY_GSM, HIGH);
 }
 
 void pwrKeyLow() {
-    Serial.println("Setting GPIO13 (PWRKEY) to LOW");
+    Serial.printf("Setting GPIO%d(PWRKEY) to LOW\n", PWRKEY_GSM);
     digitalWrite(PWRKEY_GSM, LOW);
+}
+
+// Function to trim leading and trailing whitespace
+void strtrim(char* str) {
+    char* end;
+
+    // Trim leading space
+    while (isspace((unsigned char)*str)) str++;
+
+    if (*str == 0)  // All spaces?
+        return;
+
+    // Trim trailing space
+    end = str + strlen(str) - 1;
+    while (end > str && isspace((unsigned char)*end)) end--;
+
+    // Write new null terminator
+    *(end + 1) = 0;
+}
+
+// Function to scan, trim, and copy the string
+void scanAndTrimString(const char* source, const char* format, char* dest, size_t maxLen) {
+    char temp[maxLen + 1]; // Temporary buffer
+    if (sscanf(source, format, temp) == 1) {
+        strtrim(temp);
+        strncpy(dest, temp, maxLen);
+        dest[maxLen] = '\0'; // Ensure null-termination
+    }
 }
