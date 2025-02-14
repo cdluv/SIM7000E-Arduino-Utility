@@ -363,6 +363,7 @@ bool checkAndHandleUnsolicitedResponses(char *responseLine, ModemState *modemSta
         if (cmp == 0) {
             //Serial.printf("Handling unsolicited response: %s\n", responseLine);
             reactions[mid].reactor(responseLine, modemState);
+
             return true;
         } else if (cmp < 0) {
             right = mid - 1;

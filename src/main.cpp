@@ -8,14 +8,15 @@
 
 // TODO:  Checkout https://supabase.com/ for a free backend database
 
-ModemState state = ModemState();
 bool timeout = false;
+ModemState* appModemState;
 
 //define DB Serial.println
 #define DB(x)
 
 void setup() {
     Serial.setTxBufferSize(1024);
+    Serial.setRxBufferSize(1024);
     Serial.begin(460800);
 
     //Serial2.begin(9600, SERIAL_8N1, GPIO_NUM_16, GPIO_NUM_17);
@@ -29,6 +30,10 @@ void setup() {
 
     Serial2.begin(115200, SERIAL_8N1, GPIO_NUM_16, GPIO_NUM_17);
     Serial2.setHwFlowCtrlMode(UART_HW_FLOWCTRL_DISABLE);
+    appModemState = new ModemState();
+
+    setup_commandHandler(&Serial2, appModemState, &timeout);
+
 }
 
 void wakeSim7000E() {
@@ -78,7 +83,7 @@ void wakeSim7080G() {
 }
 
 //  Wait up to 15 seconds for modem to send "SMS Ready"
-bool phoneIsReady() {
+bool phoneIsReady(ModemState *modemState) {
     uint32_t timeoutTime = millis() + 15000;
 
     while (millis() < timeoutTime) {
@@ -86,7 +91,7 @@ bool phoneIsReady() {
         send("AT", "OK", 2000, &timeout);
 
         // Has startup settled down yet?
-        if (state.smsReady) {
+        if (modemState->smsReady) {
             return true;
         }
         delay(500);
@@ -94,7 +99,7 @@ bool phoneIsReady() {
     return false;
 }
 
-void enterDiagnosticMode() {
+void enterDiagnosticMode(ModemState *modemState) {
     Serial.println("*** ENTERING DIAG MODE ***");
     while ( ui_loop() ) {
         while  (Serial2.available()) {
@@ -103,7 +108,7 @@ void enterDiagnosticMode() {
             if (data == nullptr || data.length() == 0) {
                 continue;
             }
-            checkAndHandleUnsolicitedResponses((char*)data.c_str(), &state);
+            checkAndHandleUnsolicitedResponses((char*)data.c_str(), modemState);
         }
 
         delay(50);
@@ -126,7 +131,7 @@ void loop() {
     static auto ipAddress = "139.59.180.17" ;
     static int port = 8080;
 
-    if (phoneIsReady()) {
+    if (phoneIsReady(appModemState)) {
         DB("Configuring Modem for network connection");
 
         if (connectToNetwork()) {
@@ -137,7 +142,11 @@ void loop() {
             DB("Sending update");
 
             char message[128] = {0};
-            snprintf(message, sizeof(message), "Hello from cell: %8x, tacx: %x, message: %s", state.cpsiData.cellId, state.ceregData.trackingAreaCode, state.ipAddress);
+
+            snprintf(message, sizeof(message), "Hello from cell: %8lx, tac: %x, message: %s",
+                     appModemState->cpsiData.cellId,
+                     appModemState->ceregData.trackingAreaCode,
+                     appModemState->ipAddress);
 
             updated = sendUpdate(message);
 
@@ -158,7 +167,7 @@ void loop() {
     //enterDiagnosticMode();
 
     Serial.print("Modem state:\n");
-    state.toString();
+    appModemState->toString();
     DBG("SHUTTING DOWN====================================================================");
 
 

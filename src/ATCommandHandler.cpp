@@ -13,24 +13,122 @@
 #define BUFFER_SIZE 1024
 #define MODEM_BAUD_RATE 115200
 #define SIM7000E
-extern ModemState state;          // Various states of the Modem
-extern boolean timeout;         // Timeouts are global so that they can be accessed from the callback functions
+
+ModemState * modemState;          // Various states of the Modem
+boolean *modemTimeout;         // Timeouts are global so that they can be accessed from the callback functions
+QueueHandle_t appQueue;
+HardwareSerial *modemSerial;
 
 char lineBuffer[BUFFER_SIZE];   // Global buffer to hold the incoming line
 char sendBuffer[BUFFER_SIZE];   // Global buffer to hold the outgoing line
+
 char* readLineWithTimeout(unsigned long timeoutMs, bool* timeoutOccurred);
+void receiveTask(void *pvParameters);
+
+
+
+void setup_commandHandler(HardwareSerial* serial, ModemState *modemState_p, bool *timeout) {
+    assert(serial != nullptr);
+    assert(modemState_p != nullptr);
+    assert(timeout != nullptr);
+
+    memset(lineBuffer, 0, BUFFER_SIZE);
+    memset(sendBuffer, 0, BUFFER_SIZE);
+
+    modemSerial = serial;
+    modemState = modemState_p;
+    modemTimeout = timeout;
+
+    //serial->onReceive(onReceived, false);
+
+
+    appQueue = xQueueCreate(2, BUFFER_SIZE);
+
+    if (appQueue == nullptr) {
+        // Queue was not created and must not be used.
+        Serial.println("Queue creation failed!");
+    } else {
+        Serial.println("Queue created successfully!");
+    }
+
+    xTaskCreatePinnedToCore(receiveTask, "ReceiveTask", 2048, nullptr, 1, nullptr, 1);
+
+}
+
+// Internal function to send a message to the queue - called by the onReceive hook
+void sendToQueue(const char* message) {
+    if (xQueueSend(appQueue, (void*)message, pdMS_TO_TICKS(100)) != pdPASS) {
+        Serial.printf("Failed to send '%s' to queue %x\n", message);
+    } else {
+        Serial.printf("Message '%s' sent to queue!\n", message);
+    }
+}
+
+char receivedData[BUFFER_SIZE] = {0};
+int receivedIndex = 0;
+
+void onReceived() {
+    char c;
+
+    while (modemSerial->available() > 0 && receivedIndex < BUFFER_SIZE - 1) {
+        c = modemSerial->read();
+        if (c == '\r') {
+            continue;
+        }
+
+        if (c == '\n') {
+            receivedData[receivedIndex++]= '\0';
+            break;
+        }
+        receivedData[receivedIndex++] = c;
+    }
+
+    if (receivedIndex == BUFFER_SIZE - 1) {
+        receivedIndex = 0;
+        receivedData[0] = '\0';
+        // FIXME?  Nothing to worry about here - phone shouldn't generate a buffer full of data that isn't
+        //         newline terminated.  Even if it does, we'll throw away the full buffer and start over.
+
+        Serial.println("Buffer overflow in onReceived handler - ignoring data");
+        return;
+    }
+
+    if ( c != '\n') {
+        // Not enough data to proceed
+        return;
+    }
+
+    if (receivedIndex > 0) {
+        //char* allocatedData = (char*)malloc((receivedIndex + 1) * sizeof(char));
+
+        //strcpy(allocatedData, receivedData);
+        if (checkAndHandleUnsolicitedResponses(receivedData, modemState)) {
+            //free(allocatedData);
+        } else {
+            sendToQueue(receivedData);
+            Serial.printf("Received Data: %s\n", receivedData);
+        }
+    }
+    receivedIndex = 0;
+    receivedData[0] = '\0';
+}
+
+void receiveTask(void *pvParameters) {
+    while (true) {
+        onReceived();
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
 
 
 char* send(const char* command, const char* expectedResponse, unsigned long responseTimeoutMs = TIMEOUT_MS, bool* responseTimeout = nullptr) {
     if (responseTimeout != nullptr && *responseTimeout) {
-        //Serial.printf("previous timeout - skipped: %s\n", command);
         return nullptr;
     }
-
     //Serial.printf("> %s\n", command);
 
     // Send the command
-    Serial2.println(command);
+    modemSerial->println(command);
 
     if (responseTimeout) {
         *responseTimeout = false;
@@ -38,22 +136,13 @@ char* send(const char* command, const char* expectedResponse, unsigned long resp
 
     while (true) {
         char* lineBuffer = readLineWithTimeout(responseTimeoutMs, responseTimeout);
-        if (responseTimeout && *responseTimeout) {
-            Serial.printf(" Timeout - %s.  Data: [%s]\n", *responseTimeout ? "true" : "false", lineBuffer);
+        if (lineBuffer == nullptr || (responseTimeout && *responseTimeout)) {
+            Serial.printf(" Timeout - %s.\n", responseTimeout ? "true" : "false");
             return lineBuffer;
         }
 
         // check if lineBuffer is empty
         if (lineBuffer[0] == '\0') {
-            continue;
-        }
-
-        if (checkAndHandleUnsolicitedResponses(lineBuffer, &state)) {
-            if (expectedResponse[0] == '\0' || strstr(lineBuffer, expectedResponse) || strstr(lineBuffer, "ERROR")) {
-                Serial.printf("1 < %s\n", lineBuffer);
-                return lineBuffer;
-            }
-
             continue;
         }
 
@@ -92,86 +181,35 @@ char* readLineWithTimeout(unsigned long responseTimeoutMs = TIMEOUT_MS, bool* ti
         *timeoutOccurred = false;
     }
 
-    uint32_t lastCharTime = millis();
-    int index =0;
+    char* receivedMessage;
 
-    // Wait for the first character.
-    // If no character is received within TIMEOUT_MS, return NULL.
-    while (Serial2.available() == 0) {
-        if (millis() - lastCharTime >= responseTimeoutMs) {
-            if (timeoutOccurred != nullptr) {
-                *timeoutOccurred = true;
-                lineBuffer[index] = '\0';
-            }
-            return lineBuffer;
-        }
-        delay(100);
+    if (xQueueReceive(appQueue, &receivedMessage, pdMS_TO_TICKS(responseTimeoutMs) ) != pdPASS) {
+        // No message in the queue
+        *timeoutOccurred = true;
+        return nullptr;
     }
 
-    // We have at least one character now; update the timeout timer.
-    lastCharTime = millis();
 
-    // received bytes
-    int receivedByteCount = 0;
-
-    // Read characters until a newline is encountered.
-    while (true) {
-        if (Serial2.available() > 0) {
-            int c = Serial2.read();
-
-            // Got something - save the time
-            lastCharTime = millis();
-
-            // If we get a newline, check the line buffer for unsolicited messages
-            if (c == '\n') {
-                lineBuffer[receivedByteCount] = '\0';
-
-                if (checkAndHandleUnsolicitedResponses(lineBuffer, &state)) {
-                    Serial.printf("2 < %s\n", lineBuffer);
-                    break;
-                }
-                break;
-            }
-
-            if (c == '\r') {
-                continue;
-            }
-
-            if (receivedByteCount < BUFFER_SIZE - 1) {
-                lineBuffer[receivedByteCount++] = c;
-                lineBuffer[receivedByteCount] = '\0';
-                continue;
-            }
-
-            Serial.println("!!!!!!!   Buffer overflow");
-            lineBuffer[BUFFER_SIZE -1] = '\0';
-
-        } else {
-            if (lastCharTime + responseTimeoutMs > millis() ) {
-                if (timeoutOccurred != nullptr) {
-                    *timeoutOccurred = true;
-                }
-                lineBuffer[receivedByteCount] = '\0';
-                break;
-            }
-            delay(100);
-        }
-    }
+    Serial.printf("Processing message from queue: %s\n", receivedMessage);
+    // copy receivedMessage to lineBuffer
+    int len =  strlen(receivedMessage);
+    strncpy(lineBuffer, receivedMessage, len);
+    //lineBuffer[len] = '\0';
+    Serial.println("1");
     return lineBuffer;
 }
-
 
 // Relies on checkAndHandleUnsolicitedResponses to change the state of "registeredField"
 // This happens automatically, when "sendAndWaitForResponse" is called.
 void pollForStateChangeBool(const char * queryString, const bool* registeredField) {
 
-    if (!timeout) {
+    if (! *modemTimeout) {
         uint32_t regExpireTime = millis() + 120000;
 
         while (millis() < regExpireTime && !*registeredField) {
-            timeout = false;
-            send(queryString, "OK", 2000, &timeout);
-            delay(500);
+            *modemTimeout = false;
+            send(queryString, "OK", 2000, modemTimeout);
+            delay(250);
         }
     } else {
         Serial.printf("Skipping %s\n", queryString);
@@ -203,10 +241,10 @@ bool checkSignalStrength() {
     long expiryTime = millis() + 120000;
 
     while (millis() < expiryTime) {
-        timeout = false;
-        send("AT+CSQ", "OK", 1000, &timeout);
-        if (!timeout) {
-            if (state.signalStrength > 20 && state.signalStrength < 99) {
+        *modemTimeout = false;
+        send("AT+CSQ", "OK", 1000, modemTimeout);
+        if (!*modemTimeout) {
+            if (modemState->signalStrength > 20 && modemState->signalStrength < 99) {
                 // Good signal
                 return true;
             }
@@ -221,22 +259,22 @@ bool checkSignalStrength() {
 bool getIpAddress(bool *timeoutField);
 
 void resetTcpStack() {
-    timeout = false;
-    send("AT+CIPSHUT", "SHUT OK", 2000, &timeout);
-    send("AT+CIPMUX=0", "OK", 500, &timeout);
-    send("AT+CIPRXGET=1", "OK", 500, &timeout);
-    send(R"(AT+CSTT="globaldata.iot","","")", "OK", 30000, &timeout);
+    *modemTimeout = false;
+    send("AT+CIPSHUT", "SHUT OK", 2000, modemTimeout);
+    send("AT+CIPMUX=0", "OK", 500, modemTimeout);
+    send("AT+CIPRXGET=1", "OK", 500, modemTimeout);
+    send(R"(AT+CSTT="globaldata.iot","","")", "OK", 30000, modemTimeout);
 
     // If CIICR fails, check APN, try AT_CGATT=0, AT+CGATT=1
     long expiryTime = millis() + 60000;
     while (millis() < expiryTime) {
-        char *response = send("AT+CIICR", "OK", 30000, &timeout);
+        char *response = send("AT+CIICR", "OK", 30000, modemTimeout);
         if (response && strstr(response, "ERROR")) {
-            send("AT+CGATT=0", "OK", 30000, &timeout);
-            send("AT+CGATT=1", "OK", 30000, &timeout);
+            send("AT+CGATT=0", "OK", 30000, modemTimeout);
+            send("AT+CGATT=1", "OK", 30000, modemTimeout);
         } else {
             Serial.printf("CIICR OK? -->'%s'\n", response);
-            getIpAddress(&timeout);
+            getIpAddress(modemTimeout);
             break;
         }
     }
@@ -266,8 +304,8 @@ bool getIpAddress(bool *timeoutField) {
     }
 
     // Copy IP address to state
-    strncpy(state.ipAddress, ipAddress, sizeof(state.ipAddress));
-    Serial.printf("IP Address: '%s'\n", state.ipAddress);
+    strncpy(modemState->ipAddress, ipAddress, sizeof(modemState->ipAddress));
+    Serial.printf("IP Address: '%s'\n", modemState->ipAddress);
     return true;
 
 }
@@ -275,21 +313,21 @@ bool getIpAddress(bool *timeoutField) {
 void pollForNetworkOnline() {
     uint32_t regExpireTime = millis() + 120000;
 
-    if (!timeout) {
+    if (! *modemTimeout) {
         Serial.println("Polling for network to become online");
         while (millis() < regExpireTime) {
-            timeout = false;
-            send("AT+CPSI?", "OK", 500, &timeout);
-            if (state.cpsiData.online ) {
+            *modemTimeout = false;
+            send("AT+CPSI?", "OK", 500, modemTimeout);
+            if (modemState->cpsiData.online ) {
                 // Get the network time
-                send("AT+CCLK?", "OK", 500, &timeout);
+                send("AT+CCLK?", "OK", 500, modemTimeout);
                 return;
             }
             #ifdef SIM7000E
             // Fix the network settings, and go again
-            send("AT+CNMP=38", "OK", 500, &timeout);
-            send("AT+CNMP=13", "OK", 500, &timeout);
-            send("AT+CPSI?", "OK", 500, &timeout);
+            send("AT+CNMP=38", "OK", 500, modemTimeout);
+            send("AT+CNMP=13", "OK", 500, modemTimeout);
+            send("AT+CPSI?", "OK", 500, modemTimeout);
             #endif
         }
     } else {
@@ -300,37 +338,37 @@ void pollForNetworkOnline() {
 #ifdef SIM7000E
 bool connectToNetwork() {
 
-    timeout = false;
+    *modemTimeout = false;
 
-    send("ATE0", "OK", 500, &timeout);
-    send("ATE0", "OK", 500, &timeout);
+    send("ATE0", "OK", 500, modemTimeout);
+    send("ATE0", "OK", 500, modemTimeout);
 
     Serial.println("INITIAL STATE==========================================================================");
-    timeout = false;
+    *modemTimeout = false;
 
 
-    send("AT+CGDCONT?", "OK", 500, &timeout);
+    send("AT+CGDCONT?", "OK", 500, modemTimeout);
     Serial.println("Connecting to network" );
 
-    send("AT+COPS=0", "OK", 75000, &timeout);
-    send("at+CNMP=38", "OK", 1000, &timeout);
-    send("at+CMNB=1", "OK", 1000, &timeout);
-    send(R"(AT+CGDCONT=1,"IP","globaldata.iot")", "OK", 1000, &timeout);
+    send("AT+COPS=0", "OK", 75000, modemTimeout);
+    send("at+CNMP=38", "OK", 1000, modemTimeout);
+    send("at+CMNB=1", "OK", 1000, modemTimeout);
+    send(R"(AT+CGDCONT=1,"IP","globaldata.iot")", "OK", 1000, modemTimeout);
 
 
-    send("AT+CEREG=2", "OK", 120000, &timeout);
-    if (!timeout) {
-        pollForStateChangeBool("AT+CEREG?", &state.ceregData.registered);
+    send("AT+CEREG=2", "OK", 120000, modemTimeout);
+    if (!*modemTimeout) {
+        pollForStateChangeBool("AT+CEREG?", &modemState->ceregData.registered);
     }
 
-    if (!timeout) {
+    if (!*modemTimeout) {
         if (!checkSignalStrength()) {
-            timeout = true;
+            *modemTimeout = true;
             Serial.println("Failed to get signal - timing out");
         }
     }
 
-    if (!timeout) {
+    if (! *modemTimeout) {
         pollForNetworkOnline();
     }
 
@@ -345,19 +383,19 @@ bool connectToNetwork() {
         👉 If *CIPSTART fails, ensure **APN is correct* and PDP is active (AT+CGPADDR should return an IP).
      */
 
-    timeout=false;
+    *modemTimeout=false;
 
-    send(R"(AT+CSTT="globaldata.iot","","")", "OK", 30000, &timeout);
+    send(R"(AT+CSTT="globaldata.iot","","")", "OK", 30000, modemTimeout);
 
     // Get local IP address
-    if (!getIpAddress(&timeout)) {
+    if (!getIpAddress(modemTimeout)) {
         Serial.println("Failed to get IP address - timing out");
         return true;
     }
 
     Serial.println("NETWORK SETUP COMPLETE ====================================================================");
 
-    return !timeout;
+    return !*modemTimeout;
 }
 
 bool connect(const char* ipAddress, int port) {
@@ -369,7 +407,7 @@ bool connect(const char* ipAddress, int port) {
         // create at+cipstart string using ip address and port in connectString
         snprintf(connectCommand, sizeof(connectCommand), connectString, ipAddress, port);
 
-        char * response = send(connectCommand, "CONNECT OK", 10000, &timeout);
+        char * response = send(connectCommand, "CONNECT OK", 10000, modemTimeout);
 
         if (strstr(response, "ERROR")) {
             Serial.println("Failed to connect to server - retrying");
@@ -383,42 +421,50 @@ bool connect(const char* ipAddress, int port) {
     return false;
 }
 
-const char* saltMsg = "black box tracker";
 
-bool sendUpdate(char* message) {
-    if (!state.ipConnected) {
-        Serial.println("NOT CONNECTED TO SERVER!");
-        return false;
-    }
+bool prepareToSend() {
+    modemSerial->println("AT+CIPSEND");
 
-    Serial2.println("AT+CIPSEND");
     unsigned long timeoutTimeMs = millis() + 5000;
-    while (Serial2.read() != '>') {
+
+    while (modemSerial->read() != '>') {
         if (millis() > timeoutTimeMs) {
             Serial.println("Failed to get '>' marker");
             return false;
         }
         delay(10);
     }
+    return true;
+}
+
+const char* saltMsg = "black box tracker";
+
+bool sendUpdate(char* message) {
+    if (!modemState->ipConnected) {
+        Serial.println("NOT CONNECTED TO SERVER!");
+        return false;
+    }
+
+    prepareToSend();
 
     salt(sendBuffer, message, saltMsg);
 
     // Need to wait for Modem to respond with ">"
     Serial.printf(">>> SENDING: %s\n", sendBuffer);
-    Serial2.printf("%s\n\x1A", sendBuffer);
-    Serial2.flush();
+    modemSerial->printf("%s\n\x1A", sendBuffer);
+    modemSerial->flush();
 
     return true;
 }
 
 bool close() {
-    if (!state.ipConnected) {
+    if (!modemState->ipConnected) {
         Serial.println("NOT CONNECTED TO SERVER!");
         return false;
     }
-    timeout = false;
+    *modemTimeout = false;
     delay(1000);
-    send("AT+CIPCLOSE", "CLOSE OK", 5000, &timeout);
+    send("AT+CIPCLOSE", "CLOSE OK", 5000, modemTimeout);
 
     return true;
 }
@@ -430,30 +476,30 @@ bool connectToNetwork() {
 
     timeout = false;
 
-    sendAndWaitForResponse("ATE0", "OK", 1000, &timeout);
-    sendAndWaitForResponse("ATE0", "OK", 1000, &timeout);
+    sendAndWaitForResponse("ATE0", "OK", 1000, modemTimeout);
+    sendAndWaitForResponse("ATE0", "OK", 1000, modemTimeout);
 
     Serial.println("INITIAL STATE==========================================================================");
     timeout = false;
     // Power off radio
-    sendAndWaitForResponse("AT+CFUN=0", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CFUN=0", "OK", 1000, modemTimeout);
     // Set the IP context and APN
-    sendAndWaitForResponse(R"(AT+CGDCONT=1,"IP","globaldata.iot")","OK", 10000, &timeout);
+    sendAndWaitForResponse(R"(AT+CGDCONT=1,"IP","globaldata.iot")","OK", 10000, modemTimeout);
     // Power back on
-    sendAndWaitForResponse("AT+CFUN=1", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CFUN=1", "OK", 1000, modemTimeout);
     // TODO - Wait for state to become 1.
     // Check if attached
-    sendAndWaitForResponse("AT+CGATT?", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CGATT?", "OK", 1000, modemTimeout);
     // Query the APN delivered byt the network after registration
-    sendAndWaitForResponse("AT+CGNAPN", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CGNAPN", "OK", 1000, modemTimeout);
     // Configure APN for Context 0
-    sendAndWaitForResponse(R"(AT+CNCFG=0,1,"globaldata.iot")", "OK", 1000, &timeout);
+    sendAndWaitForResponse(R"(AT+CNCFG=0,1,"globaldata.iot")", "OK", 1000, modemTimeout);
     // Activate Context 0
-    sendAndWaitForResponse("AT+CNACT=0,1", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CNACT=0,1", "OK", 1000, modemTimeout);
     // Get local IP
-    sendAndWaitForResponse("AT+CNACT?", "OK", 1000, &timeout);
+    sendAndWaitForResponse("AT+CNACT?", "OK", 1000, modemTimeout);
     // Turn off SSL
-    sendAndWaitForResponse(R"(AT+CASSLCFG=0,"SSL",0")", "OK", 1000, &timeout);
+    sendAndWaitForResponse(R"(AT+CASSLCFG=0,"SSL",0")", "OK", 1000, modemTimeout);
 
     Serial.println("Connecting to network" );
 
@@ -469,7 +515,7 @@ bool connectToNetwork() {
     }
 
     // Needed?
-    sendAndWaitForResponse("AT+CEREG=1", "OK", 120000, &timeout);
+    sendAndWaitForResponse("AT+CEREG=1", "OK", 120000, modemTimeout);
     if (!timeout) {
         pollForStateChangeBool((char*)"AT+CEREG?", &state.registeredCereg);
     }
@@ -582,12 +628,12 @@ bool sendSim7080Message(char* message) {
     Serial2.println();
     delay(3000);
 
-    sendAndWaitForResponse("AT+CASTATE?", "OK", 5000, &timeout);
+    sendAndWaitForResponse("AT+CASTATE?", "OK", 5000, modemTimeout);
 
     timeout = false;
-    sendAndWaitForResponse("AT+CACLOSE=0", "OK", 5000, &timeout);
+    sendAndWaitForResponse("AT+CACLOSE=0", "OK", 5000, modemTimeout);
 
-    sendAndWaitForResponse("AT+CASTATE?", "OK", 5000, &timeout);
+    sendAndWaitForResponse("AT+CASTATE?", "OK", 5000, modemTimeout);
 
     Serial.println(R"(AT+CAOPEN=0,0,"TCP","139.59.180.17",8080)");
 
@@ -599,7 +645,7 @@ bool sendUpdate() {
 
     while (retries-- > 0) {
         // Connect to Data Collector
-        char * response = sendAndWaitForResponse(R"(AT+CAOPEN=0,0,"TCP","139.59.180.17",8080)", "OK", 1000, &timeout);
+        char * response = sendAndWaitForResponse(R"(AT+CAOPEN=0,0,"TCP","139.59.180.17",8080)", "OK", 1000, modemTimeout);
 
         if (strstr(response, "ERROR")) {
             Serial.println("Failed to connect to server - retrying");
@@ -620,6 +666,5 @@ bool sendUpdate() {
 
 }
 #endif
-
 
 #pragma clang diagnostic pop

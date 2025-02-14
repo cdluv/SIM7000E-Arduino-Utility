@@ -12,7 +12,7 @@
 char data[1024] = {0};
 uint16_t charIndex = 0;
 uint32_t timeOfLastStatusDisplay = 0;
-extern ModemState state;
+extern ModemState modemState;
 
 // "private" methods
 void printStatus();
@@ -208,7 +208,7 @@ bool checkForPowerScenario(int ix, char value) {
             break;
         case '5':
             Serial.println("Running module diagnostics");
-            state.toString();
+            modemState.toString();
             break;
 
         default:
